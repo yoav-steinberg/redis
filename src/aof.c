@@ -60,28 +60,30 @@ void aofClosePipes(void);
 #define AOF_RW_BUF_BLOCK_SIZE (1024*1024*10)    /* 10 MB per block */
 
 typedef struct aofrwblock {
-    unsigned long used, free;
+    unsigned long first, used;
     char buf[AOF_RW_BUF_BLOCK_SIZE];
 } aofrwblock;
+
+#define AOF_RW_BUF_BLOCK_FREE(block) (AOF_RW_BUF_BLOCK_SIZE - (block)->used)
 
 /* This function free the old AOF rewrite buffer if needed, and initialize
  * a fresh new one. It tests for server.aof_rewrite_buf_blocks equal to NULL
  * so can be used for the first initialization as well. */
-void aofRewriteBufferReset(void) {
-    if (server.aof_rewrite_buf_blocks)
-        listRelease(server.aof_rewrite_buf_blocks);
+void aofRewriteBufferReset(list **aof_rewrite_buf_blocks) {
+    if (*aof_rewrite_buf_blocks)
+        listRelease(*aof_rewrite_buf_blocks);
 
-    server.aof_rewrite_buf_blocks = listCreate();
-    listSetFreeMethod(server.aof_rewrite_buf_blocks,zfree);
+    *aof_rewrite_buf_blocks = listCreate();
+    listSetFreeMethod(*aof_rewrite_buf_blocks,zfree);
 }
 
 /* Return the current size of the AOF rewrite buffer. */
-unsigned long aofRewriteBufferSize(void) {
+unsigned long aofRewriteBufferSize(list *aof_rewrite_buf_blocks) {
     listNode *ln;
     listIter li;
     unsigned long size = 0;
 
-    listRewind(server.aof_rewrite_buf_blocks,&li);
+    listRewind(aof_rewrite_buf_blocks,&li);
     while((ln = listNext(&li))) {
         aofrwblock *block = listNodeValue(ln);
         size += block->used;
@@ -89,51 +91,96 @@ unsigned long aofRewriteBufferSize(void) {
     return size;
 }
 
+/* Write AOF rewrite diff blocks to a rio stream, return 1 if more data to write, 0 if 
+ * no more data to write and -1 on error */
+int aofWriteDiffDataToRio(rio *r, list *aof_rewrite_buf_blocks) {
+    listNode *ln;
+    aofrwblock *block;
+    ssize_t size_to_write;
+
+    while(1) {
+        ln = listFirst(aof_rewrite_buf_blocks);
+        block = ln ? ln->value : NULL;
+        if (!block) return 0;
+        serverAssert(block->used);
+        while (block->used > 0) {
+            size_to_write = MIN(block->used, AOF_RW_BUF_BLOCK_SIZE - block->first);
+            if (!rioWrite(r,block->buf + block->first,size_to_write)) {
+                errno = EIO;
+                return -1;
+            }
+            block->first = (block->first + size_to_write) % AOF_RW_BUF_BLOCK_SIZE;
+            block->used -= size_to_write;
+        }
+        serverAssert(!block->used);
+        listDelNode(aof_rewrite_buf_blocks,ln);
+    }
+}
+
+/* Write AOF rewrite diff blocks to an fd, return 1 if more data to write, 0 if 
+ * no more data to write and -1 on error */
+int aofWriteDiffDataToFd(int fd, list *aof_rewrite_buf_blocks, int *abort_flag, int abort_on_short_write) {
+    listNode *ln;
+    aofrwblock *block;
+    ssize_t nwritten;
+    ssize_t size_to_write;
+
+    while(1) {
+        ln = listFirst(aof_rewrite_buf_blocks);
+        block = ln ? ln->value : NULL;
+        if ((abort_flag && *abort_flag) || !block) return 0;
+        serverAssert(block->used);
+        while (block->used > 0) {
+            size_to_write = MIN(block->used, AOF_RW_BUF_BLOCK_SIZE - block->first);
+            nwritten = write(fd,block->buf + block->first,size_to_write);
+            if (nwritten < 0 || (abort_on_short_write && nwritten != size_to_write)) {
+                //serverLog(LL_NOTICE,"@@ Error writing diff data to fd: %zd, %zd, %d", size_to_write, nwritten, errno);
+                //errno = EIO;
+                return -1;
+            } else if (nwritten == 0)
+                return 1;
+            block->first = (block->first + nwritten) % AOF_RW_BUF_BLOCK_SIZE;
+            block->used -= nwritten;
+        }
+        serverAssert(!block->used);
+        listDelNode(aof_rewrite_buf_blocks,ln);
+    }
+}
+
 /* Event handler used to send data to the child process doing the AOF
  * rewrite. We send pieces of our AOF differences buffer so that the final
  * write when the child finishes the rewrite will be small. */
 void aofChildWriteDiffData(aeEventLoop *el, int fd, void *privdata, int mask) {
-    listNode *ln;
-    aofrwblock *block;
-    ssize_t nwritten;
-    UNUSED(el);
-    UNUSED(fd);
-    UNUSED(privdata);
-    UNUSED(mask);
-
-    while(1) {
-        ln = listFirst(server.aof_rewrite_buf_blocks);
-        block = ln ? ln->value : NULL;
-        if (server.aof_stop_sending_diff || !block) {
-            aeDeleteFileEvent(server.el,server.aof_pipe_write_data_to_child,
-                              AE_WRITABLE);
-            return;
-        }
-        if (block->used > 0) {
-            nwritten = write(server.aof_pipe_write_data_to_child,
-                             block->buf,block->used);
-            if (nwritten <= 0) return;
-            memmove(block->buf,block->buf+nwritten,block->used-nwritten);
-            block->used -= nwritten;
-        }
-        if (block->used == 0) listDelNode(server.aof_rewrite_buf_blocks,ln);
-    }
+    (void)el;
+    (void)fd;
+    (void)privdata;
+    (void)mask;
+    int x; 
+    
+    if ((x = aofWriteDiffDataToFd(server.aof_pipe_write_data_to_child,
+                             server.aof_rewrite_buf_blocks, 
+                             &server.aof_stop_sending_diff, 0)) == 0) {
+        aeDeleteFileEvent(server.el,server.aof_pipe_write_data_to_child,
+                          AE_WRITABLE);
+     }
 }
 
+
 /* Append data to the AOF rewrite buffer, allocating new blocks if needed. */
-void aofRewriteBufferAppend(unsigned char *s, unsigned long len) {
-    listNode *ln = listLast(server.aof_rewrite_buf_blocks);
+void aofRewriteBufferAppend(list *aof_rewrite_buf_blocks, unsigned char *s, unsigned long len, int log) {
+    listNode *ln = listLast(aof_rewrite_buf_blocks);
     aofrwblock *block = ln ? ln->value : NULL;
 
     while(len) {
         /* If we already got at least an allocated block, try appending
          * at least some piece into it. */
         if (block) {
-            unsigned long thislen = (block->free < len) ? block->free : len;
-            if (thislen) {  /* The current block is not already full. */
-                memcpy(block->buf+block->used, s, thislen);
+            while (AOF_RW_BUF_BLOCK_FREE(block) > 0 && len > 0) { /* The current block is not already full. */
+                unsigned long next = (block->first + block->used) % AOF_RW_BUF_BLOCK_SIZE;
+                unsigned long thislen = next >= block->first ? AOF_RW_BUF_BLOCK_SIZE - next : block->first - next;
+                thislen = MIN(thislen, len);
+                memcpy(block->buf+next, s, thislen);
                 block->used += thislen;
-                block->free -= thislen;
                 s += thislen;
                 len -= thislen;
             }
@@ -143,34 +190,33 @@ void aofRewriteBufferAppend(unsigned char *s, unsigned long len) {
             int numblocks;
 
             block = zmalloc(sizeof(*block));
-            block->free = AOF_RW_BUF_BLOCK_SIZE;
+            block->first = 0;
             block->used = 0;
-            listAddNodeTail(server.aof_rewrite_buf_blocks,block);
+            listAddNodeTail(aof_rewrite_buf_blocks,block);
 
             /* Log every time we cross more 10 or 100 blocks, respectively
              * as a notice or warning. */
-            numblocks = listLength(server.aof_rewrite_buf_blocks);
-            if (((numblocks+1) % 10) == 0) {
-                int level = ((numblocks+1) % 100) == 0 ? LL_WARNING :
-                                                         LL_NOTICE;
-                serverLog(level,"Background AOF buffer size: %lu MB",
-                    aofRewriteBufferSize()/(1024*1024));
+            if (1) {
+                numblocks = listLength(aof_rewrite_buf_blocks);
+                if (((numblocks+1) % 10) == 0) {
+                    int level = ((numblocks+1) % 100) == 0 ? LL_WARNING :
+                                                             LL_NOTICE;
+                    if (log)
+                    serverLog(level,"Background AOF buffer size: %lu MB",
+                        aofRewriteBufferSize(aof_rewrite_buf_blocks)/(1024*1024));
+                    else
+                    serverLog(level,"Child Background AOF buffer size: %lu MB",
+                        aofRewriteBufferSize(aof_rewrite_buf_blocks)/(1024*1024));
+                }
             }
         }
-    }
-
-    /* Install a file event to send data to the rewrite child if there is
-     * not one already. */
-    if (aeGetFileEvents(server.el,server.aof_pipe_write_data_to_child) == 0) {
-        aeCreateFileEvent(server.el, server.aof_pipe_write_data_to_child,
-            AE_WRITABLE, aofChildWriteDiffData, NULL);
     }
 }
 
 /* Write the buffer (possibly composed of multiple blocks) into the specified
  * fd. If a short write or any other error happens -1 is returned,
  * otherwise the number of bytes written is returned. */
-ssize_t aofRewriteBufferWrite(int fd) {
+/*ssize_t aofRewriteBufferWrite(int fd) {
     listNode *ln;
     listIter li;
     ssize_t count = 0;
@@ -190,7 +236,7 @@ ssize_t aofRewriteBufferWrite(int fd) {
         }
     }
     return count;
-}
+}*/
 
 /* ----------------------------------------------------------------------------
  * AOF file implementation
@@ -223,7 +269,7 @@ void stopAppendOnly(void) {
             while(wait3(&statloc,0,NULL) != server.aof_child_pid);
         }
         /* reset the buffer accumulating changes while the child saves */
-        aofRewriteBufferReset();
+        aofRewriteBufferReset(&server.aof_rewrite_buf_blocks);
         aofRemoveTempFile(server.aof_child_pid);
         server.aof_child_pid = -1;
         server.aof_rewrite_time_start = -1;
@@ -552,8 +598,15 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
      * accumulate the differences between the child DB and the current one
      * in a buffer, so that when the child process will do its work we
      * can append the differences to the new append only file. */
-    if (server.aof_child_pid != -1)
-        aofRewriteBufferAppend((unsigned char*)buf,sdslen(buf));
+    if (server.aof_child_pid != -1) {
+        aofRewriteBufferAppend(server.aof_rewrite_buf_blocks, (unsigned char*)buf,sdslen(buf),1);
+        /* Install a file event to send data to the rewrite child if there is
+         * not one already. */
+        if (aeGetFileEvents(server.el,server.aof_pipe_write_data_to_child) == 0) {
+            aeCreateFileEvent(server.el, server.aof_pipe_write_data_to_child,
+                AE_WRITABLE, aofChildWriteDiffData, NULL);
+        }
+    }
 
     sdsfree(buf);
 }
@@ -994,14 +1047,15 @@ int rewriteHashObject(rio *r, robj *key, robj *o) {
  * the difference accumulated from the parent into a buffer, that is
  * concatenated at the end of the rewrite. */
 ssize_t aofReadDiffFromParent(void) {
-    char buf[65536]; /* Default pipe buffer size on most Linux systems. */
+    unsigned char buf[65536]; /* Default pipe buffer size on most Linux systems. */
     ssize_t nread, total = 0;
 
     while ((nread =
             read(server.aof_pipe_read_data_from_parent,buf,sizeof(buf))) > 0) {
-        server.aof_child_diff = sdscatlen(server.aof_child_diff,buf,nread);
+        aofRewriteBufferAppend(server.aof_child_buf_blocks,buf,nread,0); /* TODO: optimization, read directly into the buffer instead of appending to it */
         total += nread;
     }
+    //if (total) redisLog(REDIS_NOTICE,"@@ Read %zd from parent", total);
     return total;
 }
 
@@ -1032,7 +1086,7 @@ int rewriteAppendOnlyFile(char *filename) {
         return C_ERR;
     }
 
-    server.aof_child_diff = sdsempty();
+    aofRewriteBufferReset(&server.aof_child_buf_blocks);
     rioInitWithFile(&aof,fp);
     if (server.aof_rewrite_incremental_fsync)
         rioSetAutoSync(&aof,AOF_AUTOSYNC_BYTES);
@@ -1143,10 +1197,10 @@ int rewriteAppendOnlyFile(char *filename) {
     /* Write the received diff to the file. */
     serverLog(LL_NOTICE,
         "Concatenating %.2f MB of AOF diff received from parent.",
-        (double) sdslen(server.aof_child_diff) / (1024*1024));
-    if (rioWrite(&aof,server.aof_child_diff,sdslen(server.aof_child_diff)) == 0)
+        (double) aofRewriteBufferSize(server.aof_child_buf_blocks) / (1024*1024));
+    if (aofWriteDiffDataToRio(&aof,server.aof_child_buf_blocks) != 0)
         goto werr;
-
+    
     /* Make sure data will not remain on the OS's output buffers */
     if (fflush(fp) == EOF) goto werr;
     if (fsync(fileno(fp)) == -1) goto werr;
@@ -1209,9 +1263,10 @@ int aofCreatePipes(void) {
     int fds[6] = {-1, -1, -1, -1, -1, -1};
     int j;
 
-    if (pipe(fds) == -1) goto error; /* parent -> children data. */
-    if (pipe(fds+2) == -1) goto error; /* children -> parent ack. */
-    if (pipe(fds+4) == -1) goto error; /* children -> parent ack. */
+    if (pipe(fds) == -1) goto error; /* parent -> child data. */
+    if (pipe(fds+2) == -1) goto error; /* child -> parent ack. */
+    if (pipe(fds+4) == -1) goto error; /* parent -> child ack. */
+    
     /* Parent -> children data is non blocking. */
     if (anetNonBlock(NULL,fds[0]) != ANET_OK) goto error;
     if (anetNonBlock(NULL,fds[1]) != ANET_OK) goto error;
@@ -1224,6 +1279,9 @@ int aofCreatePipes(void) {
     server.aof_pipe_write_ack_to_child = fds[5];
     server.aof_pipe_read_ack_from_parent = fds[4];
     server.aof_stop_sending_diff = 0;
+    
+    fcntl(server.aof_pipe_write_data_to_child, F_SETPIPE_SZ, 1024*1024);
+    
     return C_OK;
 
 error:
@@ -1361,6 +1419,7 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         char tmpfile[256];
         long long now = ustime();
         mstime_t latency;
+        unsigned long residual_diff_buf_size;
 
         serverLog(LL_NOTICE,
             "Background AOF rewrite terminated with success");
@@ -1377,7 +1436,8 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
             goto cleanup;
         }
 
-        if (aofRewriteBufferWrite(newfd) == -1) {
+        residual_diff_buf_size = aofRewriteBufferSize(server.aof_rewrite_buf_blocks);
+        if (aofWriteDiffDataToFd(newfd, server.aof_rewrite_buf_blocks, NULL, 1) != 0) {
             serverLog(LL_WARNING,
                 "Error trying to flush the parent diff to the rewritten AOF: %s", strerror(errno));
             close(newfd);
@@ -1387,7 +1447,7 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         latencyAddSampleIfNeeded("aof-rewrite-diff-write",latency);
 
         serverLog(LL_NOTICE,
-            "Residual parent diff successfully flushed to the rewritten AOF (%.2f MB)", (double) aofRewriteBufferSize() / (1024*1024));
+            "Residual parent diff successfully flushed to the rewritten AOF (%.2f MB)", (double) residual_diff_buf_size / (1024*1024));
 
         /* The only remaining thing to do is to rename the temporary file to
          * the configured file and switch the file descriptor used to do AOF
@@ -1494,7 +1554,7 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
 
 cleanup:
     aofClosePipes();
-    aofRewriteBufferReset();
+    aofRewriteBufferReset(&server.aof_rewrite_buf_blocks);
     aofRemoveTempFile(server.aof_child_pid);
     server.aof_child_pid = -1;
     server.aof_rewrite_time_last = time(NULL)-server.aof_rewrite_time_start;

@@ -1934,7 +1934,8 @@ void initServer(void) {
     server.aof_child_pid = -1;
     server.rdb_child_type = RDB_CHILD_TYPE_NONE;
     server.rdb_bgsave_scheduled = 0;
-    aofRewriteBufferReset();
+    aofRewriteBufferReset(&server.aof_rewrite_buf_blocks);
+    server.aof_child_buf_blocks = NULL;
     server.aof_buf = sdsempty();
     server.lastsave = time(NULL); /* At startup we consider the DB saved. */
     server.lastbgsave_try = 0;    /* At startup we never tried to BGSAVE. */
@@ -3046,7 +3047,7 @@ sds genRedisInfoString(char *section) {
                 (long long) server.aof_rewrite_base_size,
                 server.aof_rewrite_scheduled,
                 sdslen(server.aof_buf),
-                aofRewriteBufferSize(),
+                aofRewriteBufferSize(server.aof_rewrite_buf_blocks),
                 bioPendingJobsOfType(BIO_AOF_FSYNC),
                 server.aof_delayed_fsync);
         }
@@ -3480,7 +3481,7 @@ int freeMemoryIfNeeded(void) {
     }
     if (server.aof_state != AOF_OFF) {
         mem_used -= sdslen(server.aof_buf);
-        mem_used -= aofRewriteBufferSize();
+        mem_used -= aofRewriteBufferSize(server.aof_rewrite_buf_blocks);
     }
 
     /* Check if we are over the memory limit. */

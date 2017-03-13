@@ -828,7 +828,7 @@ struct redisServer {
     int aof_pipe_read_ack_from_parent;
     int aof_stop_sending_diff;     /* If true stop sending accumulated diffs
                                       to child process. */
-    sds aof_child_diff;             /* AOF diff accumulator child side. */
+    list *aof_child_buf_blocks;    /* AOF diff accumulator child side. */
     /* RDB persistence */
     long long dirty;                /* Changes to DB from the last save */
     long long dirty_before_bgsave;  /* Used to restore dirty on failed BGSAVE */
@@ -1269,8 +1269,8 @@ int loadAppendOnlyFile(char *filename);
 void stopAppendOnly(void);
 int startAppendOnly(void);
 void backgroundRewriteDoneHandler(int exitcode, int bysignal);
-void aofRewriteBufferReset(void);
-unsigned long aofRewriteBufferSize(void);
+void aofRewriteBufferReset(list **aof_rewrite_buf_blocks);
+unsigned long aofRewriteBufferSize(list *aof_rewrite_buf_blocks);
 
 /* Sorted sets data type */
 
