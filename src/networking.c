@@ -3717,7 +3717,7 @@ void clientsEviction() {
     if (!clientEvictionCheckLimit())
         return;
 
-    raxStart(&ri,server.client_eviction_pull);
+    raxStart(&ri,server.client_eviction_pool);
     raxSeek(&ri,"$",NULL,0);
     while (raxPrev(&ri)) {
         client *best = ri.data;
